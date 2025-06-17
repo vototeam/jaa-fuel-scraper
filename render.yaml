@@ -1,0 +1,15 @@
+services:
+  - type: cron
+    name: fuel-price-updater
+    runtime: node
+    repo: https://github.com/vototeam/jaa-fuel-scraper
+    branch: main
+    schedule: "0 */12 * * *" # every 12 hours
+    buildCommand: npm install
+    startCommand: node updateFuelPrices.js
+   envVars:
+  - key: SUPABASE_URL
+    sync: false
+  - key: SUPABASE_SERVICE_ROLE_KEY
+    sync: false
+
