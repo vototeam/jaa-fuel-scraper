@@ -1,39 +1,28 @@
-const { createClient } = require('@supabase/supabase-js');
-const axios = require('axios');
-const cheerio = require('cheerio');
-require('dotenv').config();
+import { createClient } from '@supabase/supabase-js';
+import fetch from 'node-fetch';
+import * as cheerio from 'cheerio';
+import 'dotenv/config';
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Supabase setup
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const scrapeAndUpdateFuelPrices = async () => {
+  const response = await fetch('https://www.myjaa.net/gas-prices/');
+  const html = await response.text();
+  const $ = cheerio.load(html);
 
-async function scrapeFuelPrices() {
-  const response = await axios.get('https://www.jaa.com.jm/fuel-prices/');
-  const $ = cheerio.load(response.data);
+  const rows = $('table tbody tr');
+  const stations = [];
 
-  const stationData = [];
-
-  $('table tbody tr').each((index, row) => {
+  rows.each((_, row) => {
     const tds = $(row).find('td');
     const name = $(tds[0]).text().trim();
-    const e10 = parseFloat($(tds[1]).text().replace('$', ''));
-    const diesel = parseFloat($(tds[2]).text().replace('$', ''));
+    const e10 = parseFloat($(tds[1]).text().trim()) || null;
+    const diesel = parseFloat($(tds[2]).text().trim()) || null;
+    const ultraLowDiesel = parseFloat($(tds[3]).text().trim()) || null;
 
-    if (name) {
-      stationData.push({
-        name,
-        e10,
-        diesel
-      });
-    }
+    stations.push({ name, e10, diesel, ultraLowDiesel });
   });
-
-  return stationData;
-}
-
-async function syncToSupabase() {
-  const scrapedStations = await scrapeFuelPrices();
 
   const { data: existingStations, error: fetchError } = await supabase
     .from('GasStation')
@@ -44,45 +33,54 @@ async function syncToSupabase() {
     return;
   }
 
-  const updates = [];
+  const existingMap = new Map(existingStations.map(s => [s.name.toLowerCase(), s.id]));
+  const upserts = [];
   const inserts = [];
 
-  for (const station of scrapedStations) {
-    const match = existingStations.find(s => s.name === station.name);
-
-    if (match) {
-      updates.push({ id: match.id, e10: station.e10, diesel: station.diesel });
+  for (const station of stations) {
+    const lowerName = station.name.toLowerCase();
+    if (existingMap.has(lowerName)) {
+      // Update prices only
+      upserts.push({
+        id: existingMap.get(lowerName),
+        e10: station.e10,
+        diesel: station.diesel,
+        ultraLowDiesel: station.ultraLowDiesel
+      });
     } else {
-      inserts.push(station);
+      // Insert new station with name + fuel prices only
+      inserts.push({
+        name: station.name,
+        e10: station.e10,
+        diesel: station.diesel,
+        ultraLowDiesel: station.ultraLowDiesel
+      });
     }
   }
 
-  // Update existing stations
-  if (updates.length > 0) {
-    for (const update of updates) {
-      const { error } = await supabase
-        .from('GasStation')
-        .update({
-          e10: update.e10,
-          diesel: update.diesel
-        })
-        .eq('id', update.id);
+  if (upserts.length > 0) {
+    const { error: updateError } = await supabase
+      .from('GasStation')
+      .upsert(upserts, { onConflict: ['id'] });
 
-      if (error) {
-        console.error(`❌ Failed to update ${update.id}: ${error.message}`);
-      }
+    if (updateError) {
+      console.error('Error updating stations:', updateError.message);
+    } else {
+      console.log(`Updated ${upserts.length} stations`);
     }
   }
 
-  // Insert new stations
   if (inserts.length > 0) {
-    const { error } = await supabase.from('GasStation').insert(inserts);
-    if (error) {
-      console.error('❌ Failed to insert new stations:', error.message);
+    const { error: insertError } = await supabase
+      .from('GasStation')
+      .insert(inserts);
+
+    if (insertError) {
+      console.error('Error inserting stations:', insertError.message);
+    } else {
+      console.log(`Inserted ${inserts.length} new stations`);
     }
   }
+};
 
-  console.log(`✅ Updated ${updates.length} station(s), Inserted ${inserts.length} new station(s).`);
-}
-
-syncToSupabase();
+scrapeAndUpdateFuelPrices().catch(console.error);
