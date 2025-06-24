@@ -1,86 +1,121 @@
-import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
-import * as cheerio from 'cheerio';
-import 'dotenv/config';
+import { load } from 'cheerio';
+import { createClient } from '@supabase/supabase-js';
+import dotenv from 'dotenv';
 
-// Supabase setup
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+dotenv.config();
 
-const scrapeAndUpdateFuelPrices = async () => {
-  const response = await fetch('https://www.myjaa.net/gas-prices/');
-  const html = await response.text();
-  const $ = cheerio.load(html);
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-  const rows = $('table tbody tr');
-  const stations = [];
+const companies = ['TEXACO', 'FESCO', 'RUBIS', 'EPPING', 'PETCOM', 'UNIPET', 'COOL OASIS'];
 
-  rows.each((_, row) => {
-    const tds = $(row).find('td');
-    const name = $(tds[0]).text().trim();
-    const e10 = parseFloat($(tds[1]).text().trim()) || null;
-    const diesel = parseFloat($(tds[2]).text().trim()) || null;
-    const ultraLowDiesel = parseFloat($(tds[3]).text().trim()) || null;
+const scrapeAndUpdateAll = async () => {
+  const now = new Date().toISOString();
+  let totalUpdated = 0;
+  let totalInserted = 0;
 
-    stations.push({ name, e10, diesel, ultraLowDiesel });
-  });
-
+  // Fetch existing addresses once for reference
   const { data: existingStations, error: fetchError } = await supabase
     .from('GasStation')
-    .select('id, name');
+    .select('address');
 
   if (fetchError) {
-    console.error('Error fetching existing stations:', fetchError.message);
+    console.error('❌ Failed to fetch existing gas stations:', fetchError.message);
     return;
   }
 
-  const existingMap = new Map(existingStations.map(s => [s.name.toLowerCase(), s.id]));
-  const upserts = [];
-  const inserts = [];
+  const existingAddresses = new Set(existingStations.map(s => s.address));
 
-  for (const station of stations) {
-    const lowerName = station.name.toLowerCase();
-    if (existingMap.has(lowerName)) {
-      // Update prices only
-      upserts.push({
-        id: existingMap.get(lowerName),
-        e10: station.e10,
-        diesel: station.diesel,
-        ultraLowDiesel: station.ultraLowDiesel
+  for (const company of companies) {
+    const url = `https://www.calljaa.com/fuel-prices/?parish=ALL&company=${encodeURIComponent(company)}&limit=20&order=`;
+
+    console.log(`🚚 Scraping ${company}...`);
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'text/html'
+      }
+    });
+
+    const html = await response.text();
+    const $ = load(html);
+    const updates = [];
+    const inserts = [];
+
+    $('.fuel-item').each((i, el) => {
+      const name = $(el).find('.item-name--jfm').text().trim();
+      const address = $(el).find('.item-address--jfm').text().replace(/\s+/g, ' ').trim();
+
+      const priceMap = {
+        'E-10 87': null,
+        'E-10 90': null,
+        'Diesel': null,
+        'ULSD': null
+      };
+
+      $(el).find('.fuel-price-data').each((_, priceEl) => {
+        const type = $(priceEl).find('.fuel-type').text().trim();
+        const price = parseFloat($(priceEl).find('.fuel-price').text().replace('$', '').replace('/L', '').trim());
+        if (priceMap.hasOwnProperty(type)) {
+          priceMap[type] = isNaN(price) ? null : price;
+        }
       });
-    } else {
-      // Insert new station with name + fuel prices only
-      inserts.push({
-        name: station.name,
-        e10: station.e10,
-        diesel: station.diesel,
-        ultraLowDiesel: station.ultraLowDiesel
-      });
+
+      const station = {
+        name,
+        address,
+        fuelPrice_87: priceMap['E-10 87'],
+        fuelPrice_90: priceMap['E-10 90'],
+        fuelPrice_Diesel: priceMap['Diesel'],
+        fuelPrice_ULSD: priceMap['ULSD'],
+        updated_at: now
+      };
+
+      if (existingAddresses.has(address)) {
+        updates.push(station);
+      } else {
+        inserts.push({ ...station, created_at: now });
+      }
+    });
+
+    for (const station of updates) {
+      const { error } = await supabase
+        .from('GasStation')
+        .update({
+          fuelPrice_87: station.fuelPrice_87,
+          fuelPrice_90: station.fuelPrice_90,
+          fuelPrice_Diesel: station.fuelPrice_Diesel,
+          fuelPrice_ULSD: station.fuelPrice_ULSD,
+          updated_at: station.updated_at
+        })
+        .eq('address', station.address);
+
+      if (error) {
+        console.error(`❌ Failed to update ${station.address}`, error.message);
+      } else {
+        console.log(`🔄 Updated prices for: ${station.address}`);
+        totalUpdated++;
+      }
+    }
+
+    for (const station of inserts) {
+      const { error } = await supabase
+        .from('GasStation')
+        .insert(station);
+
+      if (error) {
+        console.error(`❌ Failed to insert ${station.address}`, error.message);
+      } else {
+        console.log(`➕ Inserted new station: ${station.address}`);
+        totalInserted++;
+      }
     }
   }
 
-  if (upserts.length > 0) {
-    const { error: updateError } = await supabase
-      .from('GasStation')
-      .upsert(upserts, { onConflict: ['id'] });
-
-    if (updateError) {
-      console.error('Error updating stations:', updateError.message);
-    } else {
-      console.log(`Updated ${upserts.length} stations`);
-    }
-  }
-
-  if (inserts.length > 0) {
-    const { error: insertError } = await supabase
-      .from('GasStation')
-      .insert(inserts);
-
-    if (insertError) {
-      console.error('Error inserting stations:', insertError.message);
-    } else {
-      console.log(`Inserted ${inserts.length} new stations`);
-    }
-  }
+  console.log(`\n✅ Finished. Total updated: ${totalUpdated}, Total inserted: ${totalInserted}`);
 };
 
-scrapeAndUpdateFuelPrices().catch(console.error);
+scrapeAndUpdateAll();
