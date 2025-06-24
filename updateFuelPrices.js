@@ -13,21 +13,8 @@ const supabase = createClient(
 const companies = ['TEXACO', 'FESCO', 'RUBIS', 'EPPING', 'PETCOM', 'UNIPET', 'COOL OASIS'];
 
 const scrapeAndUpdateAll = async () => {
-  const now = new Date().toISOString();
   let totalUpdated = 0;
   let totalInserted = 0;
-
-  // Fetch existing addresses once for reference
-  const { data: existingStations, error: fetchError } = await supabase
-    .from('GasStation')
-    .select('address');
-
-  if (fetchError) {
-    console.error('❌ Failed to fetch existing gas stations:', fetchError.message);
-    return;
-  }
-
-  const existingAddresses = new Set(existingStations.map(s => s.address));
 
   for (const company of companies) {
     const url = `https://www.calljaa.com/fuel-prices/?parish=ALL&company=${encodeURIComponent(company)}&limit=20&order=`;
@@ -43,7 +30,6 @@ const scrapeAndUpdateAll = async () => {
     const html = await response.text();
     const $ = load(html);
     const updates = [];
-    const inserts = [];
 
     $('.fuel-item').each((i, el) => {
       const name = $(el).find('.item-name--jfm').text().trim();
@@ -64,58 +50,63 @@ const scrapeAndUpdateAll = async () => {
         }
       });
 
-      const station = {
+      updates.push({
         name,
         address,
         fuelPrice_87: priceMap['E-10 87'],
         fuelPrice_90: priceMap['E-10 90'],
         fuelPrice_Diesel: priceMap['Diesel'],
-        fuelPrice_ULSD: priceMap['ULSD'],
-        updated_at: now
-      };
-
-      if (existingAddresses.has(address)) {
-        updates.push(station);
-      } else {
-        inserts.push({ ...station, created_at: now });
-      }
+        fuelPrice_ULSD: priceMap['ULSD']
+      });
     });
 
+    console.log(`🔄 Processing ${updates.length} stations for ${company}...`);
+
     for (const station of updates) {
-      const { error } = await supabase
+      const { data, error: fetchError } = await supabase
         .from('GasStation')
-        .update({
-          fuelPrice_87: station.fuelPrice_87,
-          fuelPrice_90: station.fuelPrice_90,
-          fuelPrice_Diesel: station.fuelPrice_Diesel,
-          fuelPrice_ULSD: station.fuelPrice_ULSD,
-          updated_at: station.updated_at
-        })
-        .eq('address', station.address);
+        .select('id')
+        .eq('address', station.address)
+        .maybeSingle();
 
-      if (error) {
-        console.error(`❌ Failed to update ${station.address}`, error.message);
-      } else {
-        console.log(`🔄 Updated prices for: ${station.address}`);
-        totalUpdated++;
+      if (fetchError) {
+        console.error(`❌ Error checking ${station.address}:`, fetchError.message);
+        continue;
       }
-    }
 
-    for (const station of inserts) {
-      const { error } = await supabase
-        .from('GasStation')
-        .insert(station);
+      if (data) {
+        // Station exists — update fuel prices
+        const { error: updateError } = await supabase
+          .from('GasStation')
+          .update({
+            fuelPrice_87: station.fuelPrice_87,
+            fuelPrice_90: station.fuelPrice_90,
+            fuelPrice_Diesel: station.fuelPrice_Diesel,
+            fuelPrice_ULSD: station.fuelPrice_ULSD
+          })
+          .eq('address', station.address);
 
-      if (error) {
-        console.error(`❌ Failed to insert ${station.address}`, error.message);
+        if (updateError) {
+          console.error(`❌ Failed to update ${station.address}:`, updateError.message);
+        } else {
+          totalUpdated++;
+        }
       } else {
-        console.log(`➕ Inserted new station: ${station.address}`);
-        totalInserted++;
+        // Station does not exist — insert
+        const { error: insertError } = await supabase
+          .from('GasStation')
+          .insert(station);
+
+        if (insertError) {
+          console.error(`❌ Failed to insert ${station.address}:`, insertError.message);
+        } else {
+          totalInserted++;
+        }
       }
     }
   }
 
-  console.log(`\n✅ Finished. Total updated: ${totalUpdated}, Total inserted: ${totalInserted}`);
+  console.log(`\n✅ Done. ${totalUpdated} stations updated, ${totalInserted} stations inserted.`);
 };
 
 scrapeAndUpdateAll();
